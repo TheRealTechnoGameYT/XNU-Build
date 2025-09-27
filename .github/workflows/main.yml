@@ -46,6 +46,7 @@ jobs:
 
       - name: Build XNU
         run: |
+          export RC_DARWIN_KERNEL_VERSION=26.1.0
           cd xnu
           make SDKROOT=macosx ARCH_CONFIGS=X86_64 KERNEL_CONFIGS=RELEASE
 
