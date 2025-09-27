@@ -1,0 +1,85 @@
+name: Build XNU Kernel (PKG → KDK)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-xnu:
+    runs-on: macos-15
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Print runner info
+        run: |
+          sw_vers
+          xcodebuild -version
+          uname -a
+          sysctl -n hw.ncpu || true
+
+      - name: Install required tools
+        run: |
+          set -e
+          if ! command -v brew >/dev/null 2>&1; then
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || true
+            echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> $GITHUB_ENV
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+          fi
+          brew install autoconf automake libtool gnu-tar || true
+          autoconf --version || true
+
+      - name: Download KDK PKG from release
+        run: |
+          set -e
+          curl -L -o kdk.pkg https://github.com/TheRealTechnoGameYT/XNU-Build/releases/download/Rien/kdk.pkg
+          ls -lh kdk.pkg
+
+      - name: Install KDK PKG silently
+        run: |
+          set -e
+          sudo installer -pkg kdk.pkg -target /
+          echo "Installed KDK pkg"
+
+      - name: Verify KDK installation
+        run: |
+          set -e
+          echo "Listing installed KDKs:"
+          ls -la /Library/Developer/KDKs
+          KDK_COUNT=$(ls /Library/Developer/KDKs/*.kdk 2>/dev/null | wc -l)
+          if [ "$KDK_COUNT" -eq 0 ]; then
+            echo "No .kdk found! Make sure the PKG installs a proper KDK."
+            exit 1
+          fi
+
+      - name: Clone XNU sources
+        run: |
+          git clone --depth 1 https://github.com/apple-oss-distributions/xnu.git xnu-src
+          cd xnu-src
+          git rev-parse --short HEAD
+
+      - name: Build XNU
+        env:
+          RC_DARWIN_KERNEL_VERSION: 20  # Big Sur, modifier si nécessaire
+          SDKROOT: ""
+        run: |
+          cd xnu-src
+          ARCH=X86_64                      # Modifier en ARM64 pour Apple Silicon
+          echo "Building XNU kernel for ARCH=$ARCH"
+          make ARCH_CONFIGS=$ARCH KERNEL_CONFIGS=RELEASE -j$(sysctl -n hw.ncpu)
+
+      - name: Upload Kernel Artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xnu-kernel
+          path: |
+            xnu-src/BUILD/obj/RELEASE_*/kernel
+            xnu-src/BUILD/obj/RELEASE_*/*.dSYM
