@@ -1,64 +1,163 @@
-name: Build XNU Kernel
+name: Build latest XNU (KDK from release)
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ main, master ]
+
+permissions:
+  contents: read
 
 jobs:
-  build:
-    runs-on: macos-13
+  build-xnu:
+    runs-on: macos-12
+    timeout-minutes: 360
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install dependencies
+      - name: Show runner & Xcode available
         run: |
-          brew install gnu-tar make cmake bison flex
+          sw_vers
+          uname -a
+          echo "List /Applications for Xcode builds:"
+          ls -1 /Applications | grep -i Xcode || true
+          echo "xcode-select status:"
+          xcode-select -p || true
+          xcodebuild -version || true
 
-      - name: Download KDK (ZIP or TAR.GZ)
+      - name: Ensure basic packages (Homebrew + tools)
         run: |
-          mkdir -p /tmp/kdk
-          curl -L -o /tmp/kdk/kdk.pkg.zip https://github.com/TheRealTechnoGameYT/XNU-Build/releases/download/Rien/KDK_26.1_25B5042k.kdk.zip || true
-          curl -L -o /tmp/kdk/kdk.pkg.tar.gz https://github.com/TheRealTechnoGameYT/XNU-Build/releases/download/Rien/KDK_26.1_25B5042k.kdk.tar.gz || true
+          set -e
+          # install Homebrew non-interactively if missing (runner usually already has it)
+          if ! command -v brew >/dev/null 2>&1; then
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || true
+            echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> $GITHUB_ENV || true
+            eval "$(/opt/homebrew/bin/brew shellenv)" || true
+          fi
+          brew update || true
+          brew install autoconf automake libtool gnu-tar jq || true
+          # list versions
+          autoconf --version || true
+          jq --version || true
 
-          if [ -f /tmp/kdk/kdk.pkg.zip ]; then
-            unzip /tmp/kdk/kdk.pkg.zip -d /tmp/kdk
-          elif [ -f /tmp/kdk/kdk.pkg.tar.gz ]; then
-            tar -xzf /tmp/kdk/kdk.pkg.tar.gz -C /tmp/kdk
+      - name: Try to select Xcode 13.2.1 (if present)
+        run: |
+          set -e
+          if [ -d /Applications/Xcode_13.2.1.app ]; then
+            echo "Selecting Xcode_13.2.1"
+            sudo xcode-select -s /Applications/Xcode_13.2.1.app/Contents/Developer
+          elif [ -d /Applications/Xcode.app ]; then
+            echo "No Xcode_13.2.1.app found — using default Xcode.app"
+            sudo xcode-select -s /Applications/Xcode.app/Contents/Developer || true
           else
-            echo "❌ Aucun KDK trouvé ! Vérifie la release GitHub."
+            echo "No Xcode app discovered in /Applications; continuing but build may fail"
+          fi
+          xcodebuild -version || true
+
+      - name: Download KDK archive from release (ZIP or TAR.GZ)
+        run: |
+          set -e
+          mkdir -p /tmp/kdk
+          # try common names you used; adjust if your release asset name is different
+          URL_ZIP="https://github.com/TheRealTechnoGameYT/XNU-Build/releases/download/Rien/KDK_26.1_25B5042k.kdk.zip"
+          URL_TGZ="https://github.com/TheRealTechnoGameYT/XNU-Build/releases/download/Rien/KDK_26.1_25B5042k.kdk.tar.gz"
+          echo "Trying $URL_ZIP"
+          if curl -sfL -o /tmp/kdk/kdk.zip "$URL_ZIP"; then
+            echo "Downloaded zip"
+            unzip -q /tmp/kdk/kdk.zip -d /tmp/kdk
+          elif curl -sfL -o /tmp/kdk/kdk.tgz "$URL_TGZ"; then
+            echo "Downloaded tar.gz"
+            tar -xzf /tmp/kdk/kdk.tgz -C /tmp/kdk
+          else
+            echo "No KDK archive found at expected release URLs. Check release asset name."
+            ls -lh /tmp/kdk || true
             exit 1
           fi
+          echo "Contents of /tmp/kdk:"
+          ls -la /tmp/kdk
 
+      - name: Install .kdk into system KDKs
+        run: |
+          set -e
           sudo mkdir -p /Library/Developer/KDKs
-          sudo cp -R /tmp/kdk/*.kdk /Library/Developer/KDKs/
-          echo "✅ KDK installé dans /Library/Developer/KDKs"
+          # copy any .kdk found in /tmp/kdk
+          count=$(ls /tmp/kdk/*.kdk 2>/dev/null | wc -l || true)
+          if [ "$count" -gt 0 ]; then
+            sudo cp -R /tmp/kdk/*.kdk /Library/Developer/KDKs/
+            echo "Copied .kdk to /Library/Developer/KDKs"
+          else
+            echo "No .kdk found in archive. Please upload a .kdk (zipped) to the release instead of a DMG/PKG."
+            ls -la /tmp/kdk
+            exit 1
+          fi
+          ls -la /Library/Developer/KDKs || true
 
-      - name: Clone latest XNU source
+      - name: Auto-detect KDK and set RC_DARWIN_KERNEL_VERSION + SDKROOT
+        id: kdk
         run: |
-          git clone https://github.com/apple-oss-distributions/xnu.git
+          set -e
+          KDK_DIR=$(ls -d /Library/Developer/KDKs/*.kdk 2>/dev/null | head -n1 || true)
+          if [ -z "$KDK_DIR" ]; then
+            echo "no_kdk=true" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          echo "found_kdk=$KDK_DIR" >> $GITHUB_OUTPUT
+          KDK_BASENAME=$(basename "$KDK_DIR")
+          # Heuristic: first number chunk in name is Darwin major (e.g. 'KDK_26.1_25B...' -> 26)
+          DARWIN_MAJOR=$(echo "$KDK_BASENAME" | grep -oE '[0-9]+' | head -n1 || true)
+          if [ -z "$DARWIN_MAJOR" ]; then
+            DARWIN_MAJOR=0
+          fi
+          echo "darwin_major=$DARWIN_MAJOR" >> $GITHUB_OUTPUT
+          SDKROOT="$KDK_DIR/System/Library/Developer/SDKs/MacOSX.sdk"
+          if [ -d "$SDKROOT" ]; then
+            echo "sdkroot=$SDKROOT" >> $GITHUB_OUTPUT
+          else
+            echo "sdkroot=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Clone latest XNU tag
+        run: |
+          set -e
+          # get latest tag via GitHub API (most recent tag entry)
+          latest_tag=$(curl -s https://api.github.com/repos/apple-oss-distributions/xnu/tags | jq -r '.[0].name')
+          if [ -z "$latest_tag" ] || [ "$latest_tag" = "null" ]; then
+            echo "Failed to get latest tag from GitHub API; falling back to default branch"
+            git clone --depth 1 https://github.com/apple-oss-distributions/xnu.git xnu
+          else
+            echo "Latest XNU tag: $latest_tag"
+            git clone --depth 1 --branch "$latest_tag" https://github.com/apple-oss-distributions/xnu.git xnu
+          fi
+          ls -la xnu
+
+      - name: Build XNU (using detected KDK)
+        env:
+          # RC_DARWIN_KERNEL_VERSION and SDKROOT are filled from previous step outputs
+          RC_DARWIN_KERNEL_VERSION: ${{ steps.kdk.outputs.darwin_major }}
+          SDKROOT: ${{ steps.kdk.outputs.sdkroot }}
+        run: |
+          set -e
           cd xnu
-          latest_tag=$(git tag | sort -V | tail -n 1)
-          git checkout "$latest_tag"
-          echo "✅ Checked out XNU version: $latest_tag"
+          echo "RC_DARWIN_KERNEL_VERSION=$RC_DARWIN_KERNEL_VERSION"
+          if [ -n "$SDKROOT" ]; then
+            echo "Using SDKROOT=$SDKROOT"
+            make SDKROOT="$SDKROOT" ARCH_CONFIGS=X86_64 KERNEL_CONFIGS=RELEASE -j$(sysctl -n hw.ncpu)
+          else
+            echo "SDKROOT not set; running make (it will try to find SDK via installed KDK/Xcode)"
+            make ARCH_CONFIGS=X86_64 KERNEL_CONFIGS=RELEASE -j$(sysctl -n hw.ncpu)
+          fi
 
-      - name: Build XNU
+      - name: Collect & upload build artifact
+        if: success()
         run: |
-          export RC_DARWIN_KERNEL_VERSION=26.1.0
-          cd xnu
-          make SDKROOT=macosx ARCH_CONFIGS=X86_64 KERNEL_CONFIGS=RELEASE
-
-      - name: Package build
-        run: |
-          cd xnu/BUILD/obj
-          tar -czf xnu-build.tar.gz *
-          mv xnu-build.tar.gz $GITHUB_WORKSPACE/
-          echo "✅ Kernel packaged as xnu-build.tar.gz"
-
-      - name: Upload artifact
+          cd xnu/BUILD/obj || exit 0
+          tar -czf $GITHUB_WORKSPACE/xnu-build-$(date +%Y%m%d-%H%M%S).tar.gz *
+          echo "Artifact ready: $(ls -lh $GITHUB_WORKSPACE/*.tar.gz)"
         uses: actions/upload-artifact@v4
         with:
           name: xnu-build
-          path: xnu-build.tar.gz
+          path: ${{ github.workspace }}/*.tar.gz
