@@ -1,0 +1,63 @@
+name: Build XNU Kernel
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: macos-13
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          brew install gnu-tar make cmake bison flex
+
+      - name: Download KDK (ZIP or TAR.GZ)
+        run: |
+          mkdir -p /tmp/kdk
+          curl -L -o /tmp/kdk/kdk.pkg.zip https://github.com/TheRealTechnoGameYT/XNU-Build/releases/download/Rien/KDK_26.1_25B5042k.kdk.zip || true
+          curl -L -o /tmp/kdk/kdk.pkg.tar.gz https://github.com/TheRealTechnoGameYT/XNU-Build/releases/download/Rien/KDK_26.1_25B5042k.kdk.tar.gz || true
+
+          if [ -f /tmp/kdk/kdk.pkg.zip ]; then
+            unzip /tmp/kdk/kdk.pkg.zip -d /tmp/kdk
+          elif [ -f /tmp/kdk/kdk.pkg.tar.gz ]; then
+            tar -xzf /tmp/kdk/kdk.pkg.tar.gz -C /tmp/kdk
+          else
+            echo "❌ Aucun KDK trouvé ! Vérifie la release GitHub."
+            exit 1
+          fi
+
+          sudo mkdir -p /Library/Developer/KDKs
+          sudo cp -R /tmp/kdk/*.kdk /Library/Developer/KDKs/
+          echo "✅ KDK installé dans /Library/Developer/KDKs"
+
+      - name: Clone latest XNU source
+        run: |
+          git clone https://github.com/apple-oss-distributions/xnu.git
+          cd xnu
+          latest_tag=$(git tag | sort -V | tail -n 1)
+          git checkout "$latest_tag"
+          echo "✅ Checked out XNU version: $latest_tag"
+
+      - name: Build XNU
+        run: |
+          cd xnu
+          make SDKROOT=macosx ARCH_CONFIGS=X86_64 KERNEL_CONFIGS=RELEASE
+
+      - name: Package build
+        run: |
+          cd xnu/BUILD/obj
+          tar -czf xnu-build.tar.gz *
+          mv xnu-build.tar.gz $GITHUB_WORKSPACE/
+          echo "✅ Kernel packaged as xnu-build.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: xnu-build
+          path: xnu-build.tar.gz
