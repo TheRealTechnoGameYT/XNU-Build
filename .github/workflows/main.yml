@@ -1,77 +1,78 @@
-name: Build XNU (GitHub-hosted macOS)
+name: Build XNU (Automatique)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:   # permet de lancer manuellement le workflow
   push:
-    branches: [ main ]
+    branches:
+      - main
+      - master
 
 jobs:
   build-xnu:
-    runs-on: macos-15        # ou macos-latest (voir migration)
-    timeout-minutes: 240
+    runs-on: macos-15
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Print runner info
         run: |
           sw_vers
           xcodebuild -version
           uname -a
+          sysctl -n hw.ncpu || true
 
-      # --- Option A: télécharger KDK depuis dortania (mirror public) ---
-      - name: Download latest KDK mirror (dortania) 
+      - name: Install required tools
         run: |
-          # This tries to fetch the latest release assets from dortania/KdkSupportPkg
-          API="https://api.github.com/repos/dortania/KdkSupportPkg/releases/latest"
-          ASSET_URL=$(curl -s $API | /usr/bin/python3 -c "import sys, json; j=json.load(sys.stdin); print([a['browser_download_url'] for a in j['assets'] if a['name'].endswith('.dmg')][0])")
-          echo "Asset: $ASSET_URL"
-          curl -L -o kdk.dmg "$ASSET_URL"
-          hdiutil attach kdk.dmg
-          sudo cp -R /Volumes/*/*.kdk /Library/Developer/KDKs/ || true
-          hdiutil detach /Volumes/* || true
-
-      # --- Option B: (alternative) Use official KDK uploaded as a repo artifact/secret ---
-      # - name: Restore official KDK from repo (if you uploaded it as a repository artifact)
-      #   run: |
-      #     mkdir -p /tmp/kdk
-      #     tar -xzf kdk-from-secrets.tar.gz -C /tmp/kdk
-      #     sudo cp -R /tmp/kdk/*.kdk /Library/Developer/KDKs/
-
-      - name: Ensure required build tools
-        run: |
-          # autoconf/automake/libtool are usually available; install with brew if necessary
-          if ! command -v autoconf >/dev/null; then
+          set -e
+          # Installer Homebrew si manquant
+          if ! command -v brew >/dev/null 2>&1; then
             /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || true
-            brew install autoconf automake libtool gnumake
+            echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> $GITHUB_ENV
+            eval "$(/opt/homebrew/bin/brew shellenv)"
           fi
+          brew install autoconf automake libtool gnu-tar || true
           autoconf --version || true
 
-      - name: Clone xnu (source)
+      - name: Install KDK
+        run: |
+          set -e
+          # KDK officiel fourni dans le repo à la racine (kdk.dmg)
+          if [ -f ./kdk.dmg ]; then
+            echo "Found official KDK in repo, mounting..."
+            hdiutil attach kdk.dmg -nobrowse -quiet -mountpoint /Volumes/_kdk_temp
+            sudo mkdir -p /Library/Developer/KDKs
+            sudo cp -R /Volumes/_kdk_temp/*.kdk /Library/Developer/KDKs/
+            hdiutil detach /Volumes/_kdk_temp -quiet
+          else
+            echo "kdk.dmg not found! Upload a KDK dmg to the repo root."
+            exit 1
+          fi
+
+      - name: Clone XNU sources
         run: |
           git clone --depth 1 https://github.com/apple-oss-distributions/xnu.git xnu-src
           cd xnu-src
           git rev-parse --short HEAD
-          ls -la
 
-      - name: Set environment & build
+      - name: Build XNU
         env:
-          # Ajuste RC_DARWIN_KERNEL_VERSION à la Darwin major version (ex: 23 pour macOS 14)
-          RC_DARWIN_KERNEL_VERSION: 23
-          # Si tu as extrait un SDK spécial, pointes-y, sinon le Makefile prend le SDK du KDK
-          SDKROOT: /Library/Developer/KDKs/KDK-14.*.kdk/System/Library/Developer/SDKs/MacOSX.sdk
-          PATH: ${{ runner.tool_cache }}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+          RC_DARWIN_KERNEL_VERSION: 20  # Modifier selon la version XNU ciblée
+          SDKROOT: ""                    # Laisser vide pour utiliser le SDK du KDK
         run: |
           cd xnu-src
-          # Exemple pour Intel; pour ARM64 utiliser ARCH_CONFIGS=ARM64
-          make SDKROOT="$SDKROOT" ARCH_CONFIGS=X86_64 KERNEL_CONFIGS=RELEASE -j$(sysctl -n hw.ncpu)
+          ARCH=X86_64                    # Modifier en ARM64 si besoin
+          echo "Building XNU kernel for ARCH=$ARCH"
+          make ARCH_CONFIGS=$ARCH KERNEL_CONFIGS=RELEASE -j$(sysctl -n hw.ncpu)
 
-      - name: Upload kernel artifact
+      - name: Upload Kernel Artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: xnu-kernel
           path: |
-            xnu-src/BUILD/obj/RELEASE_X86_64/kernel
-            xnu-src/BUILD/obj/RELEASE_X86_64/*.dSYM
+            xnu-src/BUILD/obj/RELEASE_*/kernel
+            xnu-src/BUILD/obj/RELEASE_*/*.dSYM
