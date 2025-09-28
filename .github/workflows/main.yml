@@ -226,7 +226,7 @@ jobs:
             sudo tee "$TARGET_DIR/availability.pl" >/dev/null <<'EOF'
 #!/usr/bin/env perl
 warn "availability.pl shim: limited functionality - prefer real availability.pl from KDK\n";
-exit 0
+exit 0;
 EOF
             sudo chmod +x "$TARGET_DIR/availability.pl"
             echo "Shim created at $TARGET_DIR/availability.pl"
