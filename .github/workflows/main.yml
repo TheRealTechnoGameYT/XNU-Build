@@ -43,7 +43,7 @@ jobs:
             fi
           fi
           brew update || true
-          brew install autoconf automake libtool gnu-tar bison flex gnu-sed jq coreutils || true
+          brew install autoconf automake libtool gnu-tar bison flex gnu-sed coreutils jq || true
           echo "Installed/checked packages:"
           autoconf --version || true
           jq --version || true
@@ -52,12 +52,12 @@ jobs:
         run: |
           set -euo pipefail
           echo "== Choosing Xcode if available =="
-          if [ -d /Applications/Xcode_13.2.1.app ]; then
-            echo "Selecting /Applications/Xcode_13.2.1.app"
-            sudo xcode-select -s /Applications/Xcode_13.2.1.app/Contents/Developer
-          elif [ -d /Applications/Xcode.app ]; then
-            echo "Using /Applications/Xcode.app"
+          if [ -d /Applications/Xcode.app ]; then
+            echo "Selecting /Applications/Xcode.app"
             sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          elif [ -d /Applications/Xcode_13.2.1.app ]; then
+            echo "Using /Applications/Xcode_13.2.1.app"
+            sudo xcode-select -s /Applications/Xcode_13.2.1.app/Contents/Developer
           else
             echo "No Xcode app found in /Applications; build may fail."
           fi
@@ -76,8 +76,6 @@ jobs:
 
           # list of likely asset names (adjust if your release uses different names)
           candidates=(
-            "KDK_26.1_25B5042k.kdk.zip"
-            "KDK_26.1_25B5042k.kdk.tar.gz"
             "KDK_26.1_25B5042k.kdk.zip"
             "KDK_26.1_25B5042k.kdk.tar.gz"
             "KDK_26.0_25B5042k.kdk.zip"
@@ -139,7 +137,7 @@ jobs:
             sudo mkdir -p /Library/Developer/KDKs
             sudo cp -R "$KDK_DIR" /Library/Developer/KDKs/
             KDK_INSTALLED="/Library/Developer/KDKs/$(basename "$KDK_DIR")"
-            echo "kdk_path=$KDK_INSTALLED" >> "$GITHUB_OUTPUT"
+            echo "kdk_path=$KDK_INSTALLED" >> $GITHUB_OUTPUT
             echo "Copied .kdk to $KDK_INSTALLED"
             exit 0
           fi
@@ -154,7 +152,7 @@ jobs:
           # Final check: maybe installer created the .kdk
           if ls /Library/Developer/KDKs/*.kdk >/dev/null 2>&1; then
             KDK_INSTALLED=$(ls -d /Library/Developer/KDKs/*.kdk | head -n1)
-            echo "kdk_path=$KDK_INSTALLED" >> "$GITHUB_OUTPUT"
+            echo "kdk_path=$KDK_INSTALLED" >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -186,26 +184,21 @@ jobs:
             echo "sdkroot=$sdkpath" >> $GITHUB_OUTPUT
           fi
 
-      - name: Download latest XNU tag (robust) and clone
+      - name: Download latest XNU (direct, via git ls-remote) and clone
         run: |
           set -euo pipefail
-          echo "== Fetch latest XNU tag via GitHub API (robust) =="
-          API_URL="https://api.github.com/repos/apple-oss-distributions/xnu/tags"
-          raw=$(curl -sS "$API_URL" || true)
-          # If API returned an array -> handle it, else fallback
-          if echo "$raw" | grep -q '^\s*\['; then
-            latest_tag=$(echo "$raw" | jq -r '.[].name' 2>/dev/null | sort -V | tail -n1 || true)
+          echo "== Determine latest XNU tag using git ls-remote (no jq/API) =="
+          # list remote tags, exclude annotated tag refs (with ^{}), sort versionally and take last
+          latest_tag=$(git ls-remote --tags --refs https://github.com/apple-oss-distributions/xnu.git \
+            | awk -F/ '{print $NF}' \
+            | grep -v '\^{}' \
+            | sort -V \
+            | tail -n1 || true)
+          if [ -z "$latest_tag" ]; then
+            echo "⚠️ No tag found via git ls-remote; cloning default branch (master/main)"
+            git clone --depth 1 https://github.com/apple-oss-distributions/xnu.git xnu || true
           else
-            # maybe API returned object (rate limit / error). Try fallback: fetch tags via git
-            echo "API did not return array (maybe rate limit). Falling back to git ls-remote tags."
-            latest_tag=$(git ls-remote --tags --refs https://github.com/apple-oss-distributions/xnu.git | awk -F/ '{print $NF}' | sort -V | tail -n1 || true)
-          fi
-
-          if [ -z "$latest_tag" ] || [ "$latest_tag" = "null" ]; then
-            echo "⚠️ Could not determine latest tag; cloning default branch"
-            git clone --depth 1 https://github.com/apple-oss-distributions/xnu.git xnu
-          else
-            echo "✅ Latest XNU tag: $latest_tag"
+            echo "✅ Latest XNU tag determined: $latest_tag"
             git clone --depth 1 --branch "$latest_tag" https://github.com/apple-oss-distributions/xnu.git xnu
           fi
           ls -la xnu
@@ -344,4 +337,3 @@ EOF
           tar -czf xnu-failure-artifacts-$(date +%Y%m%d-%H%M%S).tar.gz artifacts_on_failure || true
           ls -la artifacts_on_failure || true
           echo "::warning::Attach the generated failure artifact from the workflow 'Artifacts' tab for debugging."
-
