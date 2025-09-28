@@ -157,6 +157,7 @@ jobs:
           cd xnu/BUILD/obj || exit 0
           tar -czf $GITHUB_WORKSPACE/xnu-build-$(date +%Y%m%d-%H%M%S).tar.gz *
           echo "Artifact ready: $(ls -lh $GITHUB_WORKSPACE/*.tar.gz)"
+        name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: xnu-build
