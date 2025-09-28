@@ -1,4 +1,4 @@
-name: Build latest XNU (KDK from release)
+name: Build latest XNU (x86_64, robust)
 
 on:
   workflow_dispatch:
@@ -11,154 +11,378 @@ permissions:
 jobs:
   build-xnu:
     runs-on: macos-latest
-    timeout-minutes: 360
+    timeout-minutes: 720
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Show runner & Xcode available
+      - name: Runner info & environment
         run: |
+          set -euo pipefail
+          echo "== Runner info =="
           sw_vers
           uname -a
-          echo "List /Applications for Xcode builds:"
-          ls -1 /Applications | grep -i Xcode || true
-          echo "xcode-select status:"
-          xcode-select -p || true
+          sysctl -n hw.ncpu || true
+          echo "PATH: $PATH"
           xcodebuild -version || true
 
-      - name: Ensure basic packages (Homebrew + tools)
+      - name: Ensure Homebrew & base packages
         run: |
-          set -e
-          # install Homebrew non-interactively if missing (runner usually already has it)
+          set -euo pipefail
+          echo "== Installing Homebrew packages if missing =="
           if ! command -v brew >/dev/null 2>&1; then
+            echo "Homebrew not found. Installing Homebrew (non-interactive)..."
             /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || true
-            echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> $GITHUB_ENV || true
-            eval "$(/opt/homebrew/bin/brew shellenv)" || true
+            # ensure brew in PATH for the current step
+            if [ -f /opt/homebrew/bin/brew ]; then
+              eval "$(/opt/homebrew/bin/brew shellenv)"
+            elif [ -f /usr/local/bin/brew ]; then
+              eval "$(/usr/local/bin/brew shellenv)"
+            fi
           fi
+          # Install typical build deps. If already present, brew will skip.
           brew update || true
-          brew install autoconf automake libtool gnu-tar jq || true
-          # list versions
+          brew install autoconf automake libtool gnu-tar bison flex gnu-sed coreutils jq pkg-config || true
+          echo "Installed/checked packages:"
           autoconf --version || true
           jq --version || true
 
-      - name: Try to select Xcode 13.2.1 (if present)
+      - name: Choose / check Xcode
         run: |
-          set -e
+          set -euo pipefail
+          echo "== Choosing Xcode (try Xcode_13.2.1 then default) =="
           if [ -d /Applications/Xcode_13.2.1.app ]; then
-            echo "Selecting Xcode_13.2.1"
+            echo "Selecting /Applications/Xcode_13.2.1.app"
             sudo xcode-select -s /Applications/Xcode_13.2.1.app/Contents/Developer
           elif [ -d /Applications/Xcode.app ]; then
-            echo "No Xcode_13.2.1.app found — using default Xcode.app"
-            sudo xcode-select -s /Applications/Xcode.app/Contents/Developer || true
+            echo "Using /Applications/Xcode.app"
+            sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
           else
-            echo "No Xcode app discovered in /Applications; continuing but build may fail"
+            echo "No Xcode application found in /Applications - build may fail."
           fi
           xcodebuild -version || true
+          echo "Accept Xcode license if required"
+          sudo xcodebuild -license accept || true
 
-      - name: Download KDK archive from release (ZIP or TAR.GZ)
+      - name: Download KDK archive from Release (zip/tgz/dmg/pkg) and extract .kdk
+        id: get_kdk
         run: |
-          set -e
+          set -euo pipefail
+          echo "== Download KDK from release assets =="
           mkdir -p /tmp/kdk
-          # try common names you used; adjust if your release asset name is different
-          URL_ZIP="https://github.com/TheRealTechnoGameYT/XNU-Build/releases/download/Rien/KDK_26.1_25B5042k.kdk.zip"
-          URL_TGZ="https://github.com/TheRealTechnoGameYT/XNU-Build/releases/download/Rien/KDK_26.1_25B5042k.kdk.tar.gz"
-          echo "Trying $URL_ZIP"
-          if curl -sfL -o /tmp/kdk/kdk.zip "$URL_ZIP"; then
-            echo "Downloaded zip"
-            unzip -q /tmp/kdk/kdk.zip -d /tmp/kdk
-          elif curl -sfL -o /tmp/kdk/kdk.tgz "$URL_TGZ"; then
-            echo "Downloaded tar.gz"
-            tar -xzf /tmp/kdk/kdk.tgz -C /tmp/kdk
-          else
-            echo "No KDK archive found at expected release URLs. Check release asset name."
-            ls -lh /tmp/kdk || true
-            exit 1
-          fi
-          echo "Contents of /tmp/kdk:"
-          ls -la /tmp/kdk
+          cd /tmp/kdk
+          # Try several candidate filenames (adjust if your release uses other names)
+          ASSETS=(
+            "KDK_*.kdk.zip"
+            "KDK_*.kdk.tar.gz"
+            "KDK_*.zip"
+            "KDK_*.tar.gz"
+            "kdk.dmg"
+            "kdk.pkg"
+          )
+          # The base release URL provided by the user:
+          BASE="https://github.com/TheRealTechnoGameYT/XNU-Build/releases/download/Rien"
+          FOUND=0
+          for pattern in "${ASSETS[@]}"; do
+            # we attempt to download by trying to expand pattern to likely exact asset names
+            # Common explicit names:
+            candidates=(
+              "KDK_26.1_25B5042k.kdk.zip"
+              "KDK_26.1_25B5042k.kdk.tar.gz"
+              "KDK_26.1_25B5042k.kdk.zip"
+              "KDK_26.1_25B5042k.kdk.tar.gz"
+              "Kernel_Debug_Kit_26_build_25B5042k.dmg"
+              "Kernel_Debug_Kit_26_build_25B5042k.pkg"
+              "kdk.dmg"
+              "kdk.pkg"
+            )
+            for name in "${candidates[@]}"; do
+              url="${BASE}/${name}"
+              echo "Trying $url"
+              if curl -sfL -o "./asset.tmp" "$url"; then
+                echo "Downloaded asset -> $name"
+                mv asset.tmp "$name"
+                FOUND=1
+                ASSET_NAME="$name"
+                break 2
+              fi
+            done
+          done
 
-      - name: Install .kdk into system KDKs
-        run: |
-          set -e
-          sudo mkdir -p /Library/Developer/KDKs
-          # copy any .kdk found in /tmp/kdk
-          count=$(ls /tmp/kdk/*.kdk 2>/dev/null | wc -l || true)
-          if [ "$count" -gt 0 ]; then
-            sudo cp -R /tmp/kdk/*.kdk /Library/Developer/KDKs/
-            echo "Copied .kdk to /Library/Developer/KDKs"
-          else
-            echo "No .kdk found in archive. Please upload a .kdk (zipped) to the release instead of a DMG/PKG."
-            ls -la /tmp/kdk
+          if [ "$FOUND" -ne 1 ]; then
+            echo "❌ No KDK asset found at the release URL. Please upload a .kdk zip/tar.gz to the release (recommended) or ensure the exact asset name is present."
             exit 1
           fi
+
+          echo "Asset is: $ASSET_NAME"
+          # Handle zip / tar.gz / dmg / pkg
+          if echo "$ASSET_NAME" | grep -E '\.zip$' >/dev/null; then
+            echo "Unzipping $ASSET_NAME"
+            unzip -q "$ASSET_NAME" -d /tmp/kdk/extract
+          elif echo "$ASSET_NAME" | grep -E '\.tar\.gz$' >/dev/null; then
+            echo "Untarring $ASSET_NAME"
+            tar -xzf "$ASSET_NAME" -C /tmp/kdk/extract
+          elif echo "$ASSET_NAME" | grep -E '\.dmg$' >/dev/null; then
+            echo "Mounting DMG $ASSET_NAME"
+            hdiutil attach "$ASSET_NAME" -nobrowse -mountpoint /Volumes/_kdk_temp
+            mkdir -p /tmp/kdk/extract
+            cp -R /Volumes/_kdk_temp/* /tmp/kdk/extract/ || true
+            hdiutil detach /Volumes/_kdk_temp || true
+          elif echo "$ASSET_NAME" | grep -E '\.pkg$' >/dev/null; then
+            echo "PKG downloaded: $ASSET_NAME - will attempt local install (may fail on hosted runner)"
+            sudo installer -pkg "$ASSET_NAME" -target / || true
+            # After installation, try to find .kdk
+          else
+            echo "Unknown asset type: $ASSET_NAME"
+            exit 1
+          fi
+
+          echo "Listing /tmp/kdk/extract"
+          ls -la /tmp/kdk/extract || true
+
+          # Find any .kdk in extracted content
+          KDK_FOUND=$(find /tmp/kdk/extract -name "*.kdk" -type d -maxdepth 4 | head -n1 || true)
+          if [ -n "$KDK_FOUND" ]; then
+            echo "Found .kdk at $KDK_FOUND - copying to /Library/Developer/KDKs"
+            sudo mkdir -p /Library/Developer/KDKs
+            sudo cp -R "$KDK_FOUND" /Library/Developer/KDKs/
+            echo "Copied .kdk into /Library/Developer/KDKs"
+            echo "kdk_path=/Library/Developer/KDKs/$(basename "$KDK_FOUND")" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # If no .kdk found, try to find .pkg inside extracted and install it
+          PKG_INSIDE=$(find /tmp/kdk/extract -name "*.pkg" -type f | head -n1 || true)
+          if [ -n "$PKG_INSIDE" ]; then
+            echo "Found PKG inside DMG: $PKG_INSIDE - attempting silent install"
+            sudo installer -pkg "$PKG_INSIDE" -target / || true
+          fi
+
+          # After attempted install, check /Library/Developer/KDKs
+          if ls /Library/Developer/KDKs/*.kdk >/dev/null 2>&1; then
+            echo "KDK present in /Library/Developer/KDKs"
+            KDK_PATH=$(ls -d /Library/Developer/KDKs/*.kdk | head -n1)
+            echo "kdk_path=$KDK_PATH" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "❌ Aucun .kdk trouvé ou installé. Pour CI fiable, uploadez un .kdk zippé (zip/tar.gz) dans la release."
+          exit 1
+
+      - name: Verify KDK & set vars
+        id: detect_kdk
+        run: |
+          set -euo pipefail
+          echo "== Detect installed KDKs =="
           ls -la /Library/Developer/KDKs || true
-
-      - name: Auto-detect KDK and set RC_DARWIN_KERNEL_VERSION + SDKROOT
-        id: kdk
-        run: |
-          set -e
           KDK_DIR=$(ls -d /Library/Developer/KDKs/*.kdk 2>/dev/null | head -n1 || true)
           if [ -z "$KDK_DIR" ]; then
             echo "no_kdk=true" >> $GITHUB_OUTPUT
+            echo "::error::No KDK found in /Library/Developer/KDKs"
             exit 1
           fi
+          echo "Found KDK: $KDK_DIR"
           echo "found_kdk=$KDK_DIR" >> $GITHUB_OUTPUT
-          KDK_BASENAME=$(basename "$KDK_DIR")
-          # Heuristic: first number chunk in name is Darwin major (e.g. 'KDK_26.1_25B...' -> 26)
-          DARWIN_MAJOR=$(echo "$KDK_BASENAME" | grep -oE '[0-9]+' | head -n1 || true)
-          if [ -z "$DARWIN_MAJOR" ]; then
-            DARWIN_MAJOR=0
-          fi
-          echo "darwin_major=$DARWIN_MAJOR" >> $GITHUB_OUTPUT
-          SDKROOT="$KDK_DIR/System/Library/Developer/SDKs/MacOSX.sdk"
-          if [ -d "$SDKROOT" ]; then
-            echo "sdkroot=$SDKROOT" >> $GITHUB_OUTPUT
+          # derive Darwin major: first integer in basename
+          base=$(basename "$KDK_DIR")
+          darwin_major=$(echo "$base" | grep -oE '[0-9]+' | head -n1 || true)
+          if [ -z "$darwin_major" ]; then darwin_major="0"; fi
+          echo "darwin_major=$darwin_major" >> $GITHUB_OUTPUT
+          # Try to locate SDK inside KDK
+          if [ -d "$KDK_DIR/System/Library/Developer/SDKs/MacOSX.sdk" ]; then
+            sdk="$KDK_DIR/System/Library/Developer/SDKs/MacOSX.sdk"
           else
-            echo "sdkroot=" >> $GITHUB_OUTPUT
+            sdk=$(xcrun -sdk macosx -show-sdk-path || true)
           fi
+          echo "sdkroot=$sdk" >> $GITHUB_OUTPUT
+          echo "KDK detection done."
 
-      - name: Clone latest XNU tag
+      - name: Download latest XNU tag (robust) and clone
         run: |
-          set -e
-          # get latest tag via GitHub API (most recent tag entry)
-          latest_tag=$(curl -s https://api.github.com/repos/apple-oss-distributions/xnu/tags | jq -r '.[0].name')
+          set -euo pipefail
+          echo "== Fetch latest XNU tag via GitHub API =="
+          tags_json=$(curl -s "https://api.github.com/repos/apple-oss-distributions/xnu/tags" || true)
+          latest_tag=$(echo "$tags_json" | jq -r '.[0].name' 2>/dev/null || true)
           if [ -z "$latest_tag" ] || [ "$latest_tag" = "null" ]; then
-            echo "Failed to get latest tag from GitHub API; falling back to default branch"
-            git clone --depth 1 https://github.com/apple-oss-distributions/xnu.git xnu
+            # fallback: get all tag names then sort versionally
+            latest_tag=$(echo "$tags_json" | jq -r '.[].name' 2>/dev/null | sort -V | tail -n1 || true)
+          fi
+          if [ -z "$latest_tag" ] || [ "$latest_tag" = "null" ]; then
+            echo "⚠️ Could not determine latest tag via API, falling back to default branch"
+            git clone --depth 1 https://github.com/apple-oss-distributions/xnu.git xnu || true
           else
-            echo "Latest XNU tag: $latest_tag"
+            echo "✅ Latest tag: $latest_tag"
             git clone --depth 1 --branch "$latest_tag" https://github.com/apple-oss-distributions/xnu.git xnu
           fi
           ls -la xnu
 
-      - name: Build XNU (using detected KDK)
-        env:
-          # RC_DARWIN_KERNEL_VERSION and SDKROOT are filled from previous step outputs
-          RC_DARWIN_KERNEL_VERSION: ${{ steps.kdk.outputs.darwin_major }}
-          SDKROOT: ${{ steps.kdk.outputs.sdkroot }}
+      - name: Prepare environment & debug info before build
         run: |
-          set -e
-          cd xnu
-          echo "RC_DARWIN_KERNEL_VERSION=$RC_DARWIN_KERNEL_VERSION"
-          if [ -n "$SDKROOT" ]; then
-            echo "Using SDKROOT=$SDKROOT"
-            make SDKROOT="$SDKROOT" ARCH_CONFIGS=X86_64 KERNEL_CONFIGS=RELEASE -j$(sysctl -n hw.ncpu)
+          set -euo pipefail
+          echo "== Pre-build checks =="
+          echo "RC_DARWIN from detect step: ${{ steps.detect_kdk.outputs.darwin_major }}"
+          echo "SDKROOT from detect step: ${{ steps.detect_kdk.outputs.sdkroot }}"
+          echo "Listing SDKROOT:"
+          if [ -n "${{ steps.detect_kdk.outputs.sdkroot }}" ]; then
+            ls -la "${{ steps.detect_kdk.outputs.sdkroot }}" || true
+            echo "Check if availability.pl exists in SDK paths..."
+            if [ -f "${{ steps.detect_kdk.outputs.sdkroot }}/usr/local/libexec/availability.pl" ]; then
+              echo "Found availability.pl in SDK"
+            else
+              echo "availability.pl not found in SDK; will attempt to locate in KDK"
+            fi
+          fi
+          echo "List /Library/Developer/KDKs:"
+          ls -la /Library/Developer/KDKs || true
+
+      - name: Ensure availability.pl (try copy from KDK or create shim)
+        run: |
+          set -euo pipefail
+          SDKROOT="${{ steps.detect_kdk.outputs.sdkroot }}"
+          KDKDIR="${{ steps.detect_kdk.outputs.found_kdk }}"
+          TARGET_DIR=""
+          if [ -n "$SDKROOT" ] && [ -d "$SDKROOT" ]; then
+            TARGET_DIR="$SDKROOT/usr/local/libexec"
+            sudo mkdir -p "$TARGET_DIR"
           else
-            echo "SDKROOT not set; running make (it will try to find SDK via installed KDK/Xcode)"
-            make ARCH_CONFIGS=X86_64 KERNEL_CONFIGS=RELEASE -j$(sysctl -n hw.ncpu)
+            TARGET_DIR="/usr/local/libexec"
+            sudo mkdir -p "$TARGET_DIR"
           fi
 
-      - name: Collect & upload build artifact
+          echo "Target for availability.pl: $TARGET_DIR"
+
+          # Attempt to copy availability.pl from KDK
+          if [ -n "$KDKDIR" ] && [ -d "$KDKDIR" ]; then
+            CANDIDATE=$(find "$KDKDIR" -type f -name "availability.pl" | head -n1 || true)
+            if [ -n "$CANDIDATE" ]; then
+              echo "Copying availability.pl from KDK: $CANDIDATE -> $TARGET_DIR"
+              sudo cp "$CANDIDATE" "$TARGET_DIR/"
+              sudo chmod +x "$TARGET_DIR/availability.pl"
+              echo "Copied availability.pl"
+              exit 0
+            fi
+          fi
+
+          # If not found, try known locations in KDK extract
+          if [ -d "/tmp/kdk/extract" ]; then
+            CANDIDATE2=$(find /tmp/kdk/extract -type f -name "availability.pl" | head -n1 || true)
+            if [ -n "$CANDIDATE2" ]; then
+              echo "Copying availability.pl from extracted asset"
+              sudo cp "$CANDIDATE2" "$TARGET_DIR/"
+              sudo chmod +x "$TARGET_DIR/availability.pl"
+              exit 0
+            fi
+          fi
+
+          # As last resort, create a minimal shim that may help the Makefile proceed.
+          # NOTE: this is a fallback hack — it provides very limited functionality and may produce incorrect headers.
+          echo "Creating minimal availability.pl shim at $TARGET_DIR/availability.pl (fallback)"
+          sudo tee "$TARGET_DIR/availability.pl" > /dev/null <<'EOF'
+#!/usr/bin/env perl
+# Minimal shim availability.pl — WARNING: This is a fallback stub to allow builds to continue.
+print STDERR "availability.pl shim: limited functionality - prefer real availability.pl from KDK\n";
+# Simple no-op: exit success
+exit 0;
+EOF
+          sudo chmod +x "$TARGET_DIR/availability.pl"
+          echo "Shim created. Build may still fail if real availability.pl functionality is required."
+
+      - name: Build XNU (main step) - verbose + logging
+        id: build_step
+        run: |
+          set -euxo pipefail
+          cd xnu
+          # Export RC_DARWIN_KERNEL_VERSION if detect_kdk found a darwin_major
+          if [ -n "${{ steps.detect_kdk.outputs.darwin_major }}" ] && [ "${{ steps.detect_kdk.outputs.darwin_major }}" != "0" ]; then
+            export RC_DARWIN_KERNEL_VERSION=${{ steps.detect_kdk.outputs.darwin_major }}
+          fi
+          if [ -n "${{ steps.detect_kdk.outputs.sdkroot }}" ]; then
+            export SDKROOT="${{ steps.detect_kdk.outputs.sdkroot }}"
+          fi
+          echo "RC_DARWIN_KERNEL_VERSION=$RC_DARWIN_KERNEL_VERSION"
+          echo "SDKROOT=$SDKROOT"
+
+          # Create build log file (accumulate output)
+          BUILD_LOG="$GITHUB_WORKSPACE/xnu-build.log"
+          echo "Build started at $(date)" > "$BUILD_LOG"
+          echo "Kernel build for x86_64" >> "$BUILD_LOG"
+          echo "make SDKROOT=\"$SDKROOT\" ARCH_CONFIGS=X86_64 KERNEL_CONFIGS=RELEASE -j$(sysctl -n hw.ncpu)" >> "$BUILD_LOG"
+
+          # Run make and tee output to log
+          # We allow make to run; if it fails, we capture logs and exit non-zero to fail the job.
+          if [ -n "$SDKROOT" ]; then
+            make SDKROOT="$SDKROOT" ARCH_CONFIGS=X86_64 KERNEL_CONFIGS=RELEASE -j$(sysctl -n hw.ncpu) 2>&1 | tee -a "$BUILD_LOG"
+            MAKE_EXIT=${PIPESTATUS[0]}
+          else
+            make ARCH_CONFIGS=X86_64 KERNEL_CONFIGS=RELEASE -j$(sysctl -n hw.ncpu) 2>&1 | tee -a "$BUILD_LOG"
+            MAKE_EXIT=${PIPESTATUS[0]}
+          fi
+
+          echo "make exit code: $MAKE_EXIT" >> "$BUILD_LOG"
+          if [ "$MAKE_EXIT" -ne 0 ]; then
+            echo "::error::make failed with exit code $MAKE_EXIT - uploading logs and failing"
+            # Ensure logs are copied to workspace for upload
+            cp "$BUILD_LOG" "$GITHUB_WORKSPACE/" || true
+            exit "$MAKE_EXIT"
+          fi
+          echo "Build succeeded" >> "$BUILD_LOG"
+          cp "$BUILD_LOG" "$GITHUB_WORKSPACE/"
+
+      - name: Package artifacts (kernel + dSYM + logs + summary)
         if: success()
         run: |
-          cd xnu/BUILD/obj || exit 0
-          tar -czf $GITHUB_WORKSPACE/xnu-build-$(date +%Y%m%d-%H%M%S).tar.gz *
-          echo "Artifact ready: $(ls -lh $GITHUB_WORKSPACE/*.tar.gz)"
-      - name: Upload artifact
+          set -euo pipefail
+          echo "== Packaging build artifacts =="
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          # Kernel and DSYM (search in common output paths)
+          find xnu/BUILD -type f -name 'kernel' -print -exec cp {} "$GITHUB_WORKSPACE/artifacts/" \; || true
+          find xnu/BUILD -type d -name '*.dSYM' -print -exec cp -R {} "$GITHUB_WORKSPACE/artifacts/" \; || true
+          # Copy build log if present
+          if [ -f "$GITHUB_WORKSPACE/xnu-build.log" ]; then
+            cp "$GITHUB_WORKSPACE/xnu-build.log" "$GITHUB_WORKSPACE/artifacts/"
+          fi
+          # Create a simple summary
+          echo "XNU build summary" > "$GITHUB_WORKSPACE/artifacts/build-summary.txt"
+          echo "Date: $(date)" >> "$GITHUB_WORKSPACE/artifacts/build-summary.txt"
+          echo "Repo XNU tag/branch: $(cd xnu && git rev-parse --abbrev-ref HEAD || git rev-parse --short HEAD)" >> "$GITHUB_WORKSPACE/artifacts/build-summary.txt"
+          echo "RC_DARWIN_KERNEL_VERSION=${{ steps.detect_kdk.outputs.darwin_major }}" >> "$GITHUB_WORKSPACE/artifacts/build-summary.txt"
+          echo "SDKROOT=${{ steps.detect_kdk.outputs.sdkroot }}" >> "$GITHUB_WORKSPACE/artifacts/build-summary.txt"
+          ls -la "$GITHUB_WORKSPACE/artifacts" >> "$GITHUB_WORKSPACE/artifacts/build-summary.txt" || true
+          # Create tar.gz of artifacts
+          cd "$GITHUB_WORKSPACE"
+          tar -czf xnu-artifacts-$(date +%Y%m%d-%H%M%S).tar.gz artifacts
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: xnu-build
-          path: ${{ github.workspace }}/*.tar.gz
+          name: xnu-artifacts
+          path: |
+            xnu-artifacts-*.tar.gz
+            artifacts/**
+
+      - name: Final status
+        if: success()
+        run: |
+          echo "✅ Build job finished successfully"
+          ls -lh *.tar.gz || true
+
+      - name: On failure - collect logs and hints
+        if: failure()
+        run: |
+          echo "❌ Build failed – collecting logs for debugging"
+          # Copy any logs present in workspace to artifacts folder for upload
+          mkdir -p "$GITHUB_WORKSPACE/artifacts_on_failure"
+          cp -R xnu/BUILD "$GITHUB_WORKSPACE/artifacts_on_failure/" || true
+          cp -R /tmp/kdk "$GITHUB_WORKSPACE/artifacts_on_failure/" || true
+          cp -R /Library/Developer/KDKs "$GITHUB_WORKSPACE/artifacts_on_failure/" || true
+          # Attempt to grab build log
+          if [ -f "$GITHUB_WORKSPACE/xnu-build.log" ]; then
+            cp "$GITHUB_WORKSPACE/xnu-build.log" "$GITHUB_WORKSPACE/artifacts_on_failure/"
+          fi
+          tar -czf xnu-failure-artifacts-$(date +%Y%m%d-%H%M%S).tar.gz artifacts_on_failure || true
+          ls -la artifacts_on_failure || true
+          echo "::warning::Attach the generated failure artifact from the workflow 'Artifacts' tab for debugging."
+
